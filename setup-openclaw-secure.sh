@@ -399,7 +399,7 @@ if ! grep -q "DenyUsers ${OPENCLAW_USER}" "${SSH_CONFIG}"; then
     echo "DenyUsers ${OPENCLAW_USER}" >> "${SSH_CONFIG}"
 fi
 
-systemctl restart sshd
+systemctl restart ssh
 
 # --- fail2ban ---
 cat > /etc/fail2ban/jail.local <<F2B
