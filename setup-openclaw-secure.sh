@@ -233,14 +233,13 @@ log "Gateway auth token generated."
 info "Creating hardened Docker Compose configuration..."
 
 cat > "$OPENCLAW_DIR/docker-compose.yml" << COMPOSEFILE
-version: '3.8'
-
 services:
   openclaw-gateway:
     image: ghcr.io/openclaw/openclaw:latest
     container_name: openclaw-gateway
     restart: unless-stopped
-    command: ["gateway", "start", "--foreground"]
+    entrypoint: ["node", "/app/dist/index.js"]
+    command: ["gateway", "--bind", "lan", "--port", "18789"]
 
     # --- Security hardening ---
     user: "1000:1000"
@@ -313,6 +312,12 @@ services:
       - ${OPENCLAW_WORKSPACE}:/home/node/.openclaw/workspace:rw
     environment:
       - OPENCLAW_GATEWAY_TOKEN=${GATEWAY_TOKEN}
+      - HOME=/home/node
+      - TERM=xterm-256color
+    stdin_open: true
+    tty: true
+    init: true
+    entrypoint: ["node", "/app/dist/index.js"]
 COMPOSEFILE
 
 chown "$REAL_USER:$REAL_USER" "$OPENCLAW_DIR/docker-compose.yml"
@@ -343,9 +348,14 @@ cat > "$OPENCLAW_DIR/onboard.sh" << 'ONBOARD'
 set -euo pipefail
 cd "$(dirname "$0")"
 echo "Starting OpenClaw onboarding wizard..."
-echo "This will configure your model provider, channels, and skills."
 echo ""
-docker compose run --rm openclaw-cli onboard
+echo "When prompted, recommended settings:"
+echo "  - Gateway bind: lan"
+echo "  - Gateway auth: token"
+echo "  - Tailscale exposure: Off"
+echo "  - Install Gateway daemon: No"
+echo ""
+docker compose run --rm openclaw-cli onboard --no-install-daemon
 echo ""
 echo "Onboarding complete! Start OpenClaw with: ./start.sh"
 ONBOARD
@@ -378,6 +388,13 @@ cat > "$OPENCLAW_DIR/dashboard.sh" << 'DASH'
 cd "$(dirname "$0")"
 docker compose run --rm openclaw-cli dashboard --no-open
 DASH
+
+# Doctor/health check script
+cat > "$OPENCLAW_DIR/doctor.sh" << 'DOCTOR'
+#!/usr/bin/env bash
+cd "$(dirname "$0")"
+docker compose run --rm openclaw-cli doctor
+DOCTOR
 
 # Security audit script
 cat > "$OPENCLAW_DIR/security-audit.sh" << 'AUDIT'
@@ -429,7 +446,7 @@ docker compose exec openclaw-gateway node -e "try{console.log(require('./package
 UPDATE
 
 # Make all scripts executable
-chmod +x "$OPENCLAW_DIR"/{onboard,start,stop,dashboard,security-audit,update}.sh
+chmod +x "$OPENCLAW_DIR"/{onboard,start,stop,dashboard,doctor,security-audit,update}.sh
 chown -R "$REAL_USER:$REAL_USER" "$OPENCLAW_DIR"
 
 log "Helper scripts created."
