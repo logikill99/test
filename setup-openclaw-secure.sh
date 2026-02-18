@@ -1,231 +1,319 @@
 #!/usr/bin/env bash
-# ============================================================================
-# OpenClaw Secure LAN Setup Script
-# Target: Ubuntu Server 24.04.4 LTS — N150 Mini PC (16GB RAM)
-# Purpose: Install OpenClaw and lock it down to local network access only
+# =============================================================================
+# OpenClaw Secure Bare-Metal Setup Script (No Docker)
+# =============================================================================
+# Target: Ubuntu Server 24.04.4 LTS on N150 Mini PC (16GB RAM)
+# Method: Native install via npm (Node.js 22+)
+# Access: Local network only (UFW firewall enforced)
+#
+# Security hardening included:
+#   • Dedicated unprivileged 'openclaw' user (no sudo)
+#   • UFW firewall: SSH + gateway restricted to your LAN CIDR
+#   • SSH hardened: root login disabled, fail2ban active
+#   • Gateway binds to LAN interface (not 0.0.0.0, not public)
+#   • Token-based authentication on the Control UI
+#   • Exec consent mode: approval required before every command
+#   • DM pairing: unknown senders must be approved
+#   • Filesystem restricted to workspace only
+#   • ~/.openclaw permissions locked to owner-only (700/600)
+#   • Automatic security updates enabled
+#   • Systemd service: auto-start on boot, auto-restart on crash
 #
 # Usage:
-#   chmod +x setup-openclaw.sh
-#   sudo ./setup-openclaw.sh
+#   chmod +x setup-openclaw-bare.sh
+#   sudo ./setup-openclaw-bare.sh
 #
-# What this script does:
-#   1. Creates a dedicated 'openclaw' system user (least-privilege)
-#   2. Installs Node.js 22 LTS via NodeSource
-#   3. Installs OpenClaw globally
-#   4. Configures UFW firewall (SSH + OpenClaw from LAN only)
-#   5. Hardens sysctl (disable IP forwarding, ignore ICMP redirects, etc.)
-#   6. Sets up OpenClaw gateway as a systemd service
-#   7. Binds the gateway to the LAN interface only
-#   8. Enables unattended security updates
+# If your LAN is not 192.168.1.0/24:
+#   sudo LAN_CIDR="192.168.0.0/24" ./setup-openclaw-bare.sh
 #
-# After running:
-#   - Access the Control UI from any device on your LAN at:
-#     http://<MINI-PC-IP>:18789
-#   - Run the onboarding wizard:
-#     sudo -u openclaw openclaw onboard
-#   - Check status:
-#     systemctl status openclaw-gateway
-#   - View logs:
-#     journalctl -u openclaw-gateway -f
-# ============================================================================
+# =============================================================================
 
 set -euo pipefail
-IFS=$'\n\t'
 
-# ── Color helpers ────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+# ------------------------------- Configuration -------------------------------
 
-info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
-ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-fail()  { echo -e "${RED}[FAIL]${NC}  $*"; exit 1; }
+# Local network CIDR — adjust to YOUR network
+LAN_CIDR="${LAN_CIDR:-192.168.1.0/24}"
 
-# ── Pre-flight checks ───────────────────────────────────────────────────────
-[[ $EUID -eq 0 ]] || fail "This script must be run as root. Use: sudo ./setup-openclaw.sh"
-
-# Verify we're on Ubuntu 24.04
-if ! grep -q 'Ubuntu' /etc/os-release 2>/dev/null; then
-    fail "This script is designed for Ubuntu Server 24.04 LTS."
-fi
-
-info "Starting OpenClaw secure LAN setup..."
-echo ""
-
-# ── Detect LAN subnet ───────────────────────────────────────────────────────
-info "Detecting network configuration..."
-
-# Get the default route interface
-DEFAULT_IFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
-if [[ -z "$DEFAULT_IFACE" ]]; then
-    fail "Could not detect default network interface. Check your network config."
-fi
-
-# Get the LAN IP and subnet
-LAN_IP=$(ip -4 addr show "$DEFAULT_IFACE" | awk '/inet / {print $2}' | head -n1)
-if [[ -z "$LAN_IP" ]]; then
-    fail "Could not detect LAN IP on interface $DEFAULT_IFACE."
-fi
-
-# Extract CIDR subnet for firewall rules
-LAN_SUBNET=$(ip -4 route show dev "$DEFAULT_IFACE" | awk '/proto kernel/ {print $1}' | head -n1)
-if [[ -z "$LAN_SUBNET" ]]; then
-    # Fallback: derive from IP (assume /24)
-    LAN_SUBNET=$(echo "$LAN_IP" | sed 's|\.[0-9]*/.*|.0/24|')
-    warn "Could not auto-detect subnet; assuming $LAN_SUBNET"
-fi
-
-LAN_IP_BARE=$(echo "$LAN_IP" | cut -d'/' -f1)
-
-ok "Interface:  $DEFAULT_IFACE"
-ok "LAN IP:     $LAN_IP_BARE"
-ok "LAN Subnet: $LAN_SUBNET (firewall allow-range)"
-echo ""
-
-# ── 1. System updates ───────────────────────────────────────────────────────
-info "Updating system packages..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get upgrade -y -qq
-ok "System packages updated."
-
-# ── 2. Install essential dependencies ────────────────────────────────────────
-info "Installing essential packages..."
-apt-get install -y -qq \
-    curl \
-    gnupg \
-    ca-certificates \
-    git \
-    build-essential \
-    unattended-upgrades \
-    apt-listchanges \
-    ufw \
-    fail2ban \
-    jq
-ok "Dependencies installed."
-
-# ── 3. Enable unattended security updates ────────────────────────────────────
-info "Configuring automatic security updates..."
-cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-EOF
-systemctl enable --now unattended-upgrades &>/dev/null
-ok "Automatic security updates enabled."
-
-# ── 4. Create dedicated openclaw user ────────────────────────────────────────
+# Dedicated unprivileged user (no sudo access)
 OPENCLAW_USER="openclaw"
-OPENCLAW_HOME="/home/${OPENCLAW_USER}"
 
-if id "$OPENCLAW_USER" &>/dev/null; then
-    warn "User '$OPENCLAW_USER' already exists. Skipping creation."
-else
-    info "Creating dedicated system user '${OPENCLAW_USER}'..."
-    useradd \
-        --system \
-        --create-home \
-        --home-dir "$OPENCLAW_HOME" \
-        --shell /bin/bash \
-        --comment "OpenClaw Service Account" \
-        "$OPENCLAW_USER"
-    ok "User '${OPENCLAW_USER}' created."
+# Swap size
+SWAP_SIZE="4G"
+
+# Gateway port
+GATEWAY_PORT="18789"
+
+# Node.js major version
+NODE_MAJOR="22"
+
+# --------------------------------- Preflight ---------------------------------
+
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: This script must be run as root (use sudo)."
+    exit 1
 fi
 
-# ── 5. Install Node.js 22 LTS ───────────────────────────────────────────────
-info "Installing Node.js 22 LTS..."
-if command -v node &>/dev/null; then
-    CURRENT_NODE=$(node --version 2>/dev/null || echo "unknown")
-    if [[ "$CURRENT_NODE" == v22.* ]]; then
-        ok "Node.js $CURRENT_NODE already installed. Skipping."
-    else
-        warn "Node.js $CURRENT_NODE found but need v22+. Installing v22..."
-        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-        apt-get install -y -qq nodejs
+if ! grep -qi "ubuntu" /etc/os-release 2>/dev/null; then
+    echo "WARNING: This script targets Ubuntu 24.04. Proceed at your own risk."
+fi
+
+# Detect local IP
+LOCAL_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || hostname -I | awk '{print $1}')
+
+# Generate a secure random gateway token (48 hex chars)
+GATEWAY_TOKEN=$(openssl rand -hex 24)
+
+echo "============================================================================="
+echo "  OpenClaw Bare-Metal Secure Setup"
+echo "============================================================================="
+echo ""
+echo "  Machine IP        : ${LOCAL_IP}"
+echo "  Allowed LAN       : ${LAN_CIDR}"
+echo "  OpenClaw user     : ${OPENCLAW_USER}"
+echo "  Gateway port      : ${GATEWAY_PORT}"
+echo "  Swap size         : ${SWAP_SIZE}"
+echo "  Install method    : Native (npm, no Docker)"
+echo ""
+echo "  Wrong subnet? Exit and re-run:"
+echo "    sudo LAN_CIDR=\"10.0.0.0/24\" ./setup-openclaw-bare.sh"
+echo ""
+read -rp "  Press Enter to continue or Ctrl+C to abort..."
+
+# ========================= STEP 1: System Update =============================
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "[1/9] Updating system and installing prerequisites..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -y
+apt-get upgrade -y
+apt-get install -y \
+    curl \
+    wget \
+    git \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    ufw \
+    unattended-upgrades \
+    fail2ban \
+    jq \
+    build-essential
+
+echo "  ✓ System packages updated"
+
+# ========================= STEP 2: Swap File ================================
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "[2/9] Configuring swap..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+if swapon --show | grep -q "/swapfile"; then
+    echo "  Swap already exists, skipping."
+else
+    fallocate -l "${SWAP_SIZE}" /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+
+    if ! grep -q "/swapfile" /etc/fstab; then
+        echo "/swapfile none swap sw 0 0" >> /etc/fstab
     fi
+
+    cat > /etc/sysctl.d/99-openclaw.conf <<SYSCTL
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+SYSCTL
+    sysctl -p /etc/sysctl.d/99-openclaw.conf >/dev/null 2>&1
+
+    echo "  ✓ ${SWAP_SIZE} swap created"
+fi
+
+# ========================= STEP 3: Create Locked-Down User ==================
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "[3/9] Creating dedicated '${OPENCLAW_USER}' user (no sudo)..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+if id "${OPENCLAW_USER}" &>/dev/null; then
+    echo "  User '${OPENCLAW_USER}' already exists."
 else
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-    apt-get install -y -qq nodejs
+    useradd -m -s /bin/bash "${OPENCLAW_USER}"
+    echo "  ✓ User '${OPENCLAW_USER}' created"
 fi
-ok "Node.js $(node --version) installed."
-ok "npm $(npm --version) installed."
 
-# Set up npm global directory for openclaw user (no sudo needed for npm -g)
-info "Configuring npm global directory for '${OPENCLAW_USER}'..."
+# Explicitly ensure this user is NOT in the sudo group
+if groups "${OPENCLAW_USER}" | grep -qw sudo; then
+    gpasswd -d "${OPENCLAW_USER}" sudo 2>/dev/null || true
+    echo "  ✓ Removed from sudo group"
+fi
+
+echo "  ✓ User '${OPENCLAW_USER}' has no sudo/root privileges"
+
+# ========================= STEP 4: Install Node.js 22 =======================
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "[4/9] Installing Node.js ${NODE_MAJOR}..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Check if Node 22+ is already installed
+CURRENT_NODE_MAJOR=""
+if command -v node &>/dev/null; then
+    CURRENT_NODE_MAJOR=$(node -v | sed 's/^v//' | cut -d. -f1)
+fi
+
+if [[ "${CURRENT_NODE_MAJOR}" -ge "${NODE_MAJOR}" ]] 2>/dev/null; then
+    echo "  Node.js already installed: $(node -v)"
+else
+    # Install via NodeSource (official method for Ubuntu)
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
+    apt-get install -y nodejs
+
+    echo "  ✓ Node.js installed: $(node -v)"
+fi
+
+echo "  ✓ npm version: $(npm -v)"
+
+# Configure npm global prefix for the openclaw user (avoids permission issues)
+OPENCLAW_HOME="/home/${OPENCLAW_USER}"
 NPM_GLOBAL="${OPENCLAW_HOME}/.npm-global"
-sudo -u "$OPENCLAW_USER" mkdir -p "$NPM_GLOBAL"
-sudo -u "$OPENCLAW_USER" bash -c "npm config set prefix '${NPM_GLOBAL}'"
 
-# Add to PATH in .bashrc
-if ! grep -q 'npm-global' "${OPENCLAW_HOME}/.bashrc" 2>/dev/null; then
-    cat >> "${OPENCLAW_HOME}/.bashrc" <<EOF
-
-# npm global binaries
-export PATH="${NPM_GLOBAL}/bin:\$PATH"
-export NODE_OPTIONS="--max-old-space-size=4096"
-EOF
-fi
-ok "npm global prefix set to ${NPM_GLOBAL}."
-
-# ── 6. Install OpenClaw ─────────────────────────────────────────────────────
-info "Installing OpenClaw..."
-sudo -u "$OPENCLAW_USER" bash -c "
-    export PATH='${NPM_GLOBAL}/bin:\$PATH'
-    npm install -g openclaw@latest 2>&1
+su - "${OPENCLAW_USER}" -c "
+    mkdir -p ${NPM_GLOBAL}
+    npm config set prefix ${NPM_GLOBAL}
 "
-ok "OpenClaw installed."
 
-# Verify
-OPENCLAW_BIN="${NPM_GLOBAL}/bin/openclaw"
-if [[ ! -f "$OPENCLAW_BIN" ]]; then
-    fail "OpenClaw binary not found at ${OPENCLAW_BIN}. Installation may have failed."
+# Add npm global bin to the user's PATH permanently
+BASHRC="${OPENCLAW_HOME}/.bashrc"
+NPM_PATH_LINE="export PATH=\"${NPM_GLOBAL}/bin:\$PATH\""
+
+if ! grep -qF "${NPM_GLOBAL}/bin" "${BASHRC}" 2>/dev/null; then
+    echo "" >> "${BASHRC}"
+    echo "# OpenClaw npm global path" >> "${BASHRC}"
+    echo "${NPM_PATH_LINE}" >> "${BASHRC}"
 fi
-ok "OpenClaw binary verified at ${OPENCLAW_BIN}."
 
-# ── 7. Create OpenClaw configuration ────────────────────────────────────────
+echo "  ✓ npm global prefix configured at ${NPM_GLOBAL}"
+
+# ========================= STEP 5: Install OpenClaw ==========================
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "[5/9] Installing OpenClaw via npm..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+su - "${OPENCLAW_USER}" -c "
+    export PATH=\"${NPM_GLOBAL}/bin:\$PATH\"
+    npm install -g openclaw@latest
+"
+
+# Verify installation
+OPENCLAW_BIN="${NPM_GLOBAL}/bin/openclaw"
+if [[ -x "${OPENCLAW_BIN}" ]]; then
+    OPENCLAW_VERSION=$(su - "${OPENCLAW_USER}" -c "export PATH=\"${NPM_GLOBAL}/bin:\$PATH\" && openclaw --version" 2>/dev/null || echo "installed")
+    echo "  ✓ OpenClaw installed: ${OPENCLAW_VERSION}"
+else
+    echo "ERROR: OpenClaw binary not found at ${OPENCLAW_BIN}"
+    echo "  Try running manually: su - ${OPENCLAW_USER} -c 'npm install -g openclaw@latest'"
+    exit 1
+fi
+
+# ========================= STEP 6: Security-Hardened Config ==================
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "[6/9] Writing security-hardened OpenClaw configuration..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
 OPENCLAW_CONFIG_DIR="${OPENCLAW_HOME}/.openclaw"
-info "Creating OpenClaw configuration..."
+OPENCLAW_WORKSPACE="${OPENCLAW_CONFIG_DIR}/workspace"
+OPENCLAW_CONFIG_FILE="${OPENCLAW_CONFIG_DIR}/openclaw.json"
 
-sudo -u "$OPENCLAW_USER" mkdir -p "${OPENCLAW_CONFIG_DIR}"
-sudo -u "$OPENCLAW_USER" mkdir -p "${OPENCLAW_CONFIG_DIR}/workspace"
+mkdir -p "${OPENCLAW_CONFIG_DIR}"
+mkdir -p "${OPENCLAW_WORKSPACE}"
 
-# Write a baseline secure config
-# - Bind to LAN IP so it's accessible on the network but NOT on 0.0.0.0
-# - Enable password auth on the gateway dashboard
-# - DM policy set to pairing (default, safest)
-GATEWAY_PASSWORD=$(openssl rand -base64 24 | tr -d '=/+' | head -c 24)
-
-sudo -u "$OPENCLAW_USER" tee "${OPENCLAW_CONFIG_DIR}/openclaw.json" > /dev/null <<EOJSON
+# Only write config if one doesn't already exist (don't clobber re-runs)
+if [[ ! -f "${OPENCLAW_CONFIG_FILE}" ]]; then
+    cat > "${OPENCLAW_CONFIG_FILE}" <<CLAWCONFIG
 {
+  // Security-hardened config for LAN-only bare-metal deployment
+  // Generated by setup script on $(date -Iseconds)
+  //
+  // Gateway: binds to LAN IP, token auth required
   "gateway": {
-    "port": 18789,
-    "bind": "${LAN_IP_BARE}",
+    "port": ${GATEWAY_PORT},
+    "mode": "local",
+    "bind": "lan",
     "auth": {
-      "mode": "password",
-      "password": "${GATEWAY_PASSWORD}"
+      "mode": "token",
+      "token": "${GATEWAY_TOKEN}"
     }
   },
+
+  // Session isolation: each sender gets their own session
+  "session": {
+    "dmScope": "per-channel-peer"
+  },
+
+  // Tool security: consent mode ON — you approve every exec/write
+  "tools": {
+    "fs": {
+      "workspaceOnly": true
+    },
+    "exec": {
+      "ask": "always"
+    }
+  },
+
+  // Agent workspace
   "agent": {
-    "model": "anthropic/claude-sonnet-4-20250514"
+    "workspace": "~/.openclaw/workspace"
   }
 }
-EOJSON
+CLAWCONFIG
+    echo "  ✓ Hardened config written to ${OPENCLAW_CONFIG_FILE}"
+else
+    echo "  Config already exists at ${OPENCLAW_CONFIG_FILE}, not overwriting."
+    echo "  To apply hardened defaults, delete it and re-run this script."
+fi
 
-chown -R "$OPENCLAW_USER":"$OPENCLAW_USER" "$OPENCLAW_CONFIG_DIR"
-chmod 700 "$OPENCLAW_CONFIG_DIR"
-chmod 600 "${OPENCLAW_CONFIG_DIR}/openclaw.json"
-ok "OpenClaw configuration created."
+# Write exec-approvals.json for defense-in-depth
+EXEC_APPROVALS="${OPENCLAW_CONFIG_DIR}/exec-approvals.json"
+if [[ ! -f "${EXEC_APPROVALS}" ]]; then
+    cat > "${EXEC_APPROVALS}" <<EXECAPPROVALS
+{
+  "version": 1,
+  "defaults": {
+    "security": "deny",
+    "ask": "always",
+    "askFallback": "deny"
+  }
+}
+EXECAPPROVALS
+    echo "  ✓ Exec approvals: deny-by-default, ask-always"
+fi
 
-# ── 8. Create systemd service ───────────────────────────────────────────────
-info "Creating systemd service for OpenClaw gateway..."
+# Lock down permissions on the config directory
+chown -R "${OPENCLAW_USER}:${OPENCLAW_USER}" "${OPENCLAW_CONFIG_DIR}"
+chmod 700 "${OPENCLAW_CONFIG_DIR}"
+chmod 600 "${OPENCLAW_CONFIG_FILE}"
+chmod 600 "${EXEC_APPROVALS}"
+chmod 700 "${OPENCLAW_WORKSPACE}"
 
-cat > /etc/systemd/system/openclaw-gateway.service <<EOF
+echo "  ✓ File permissions locked (700/600, owner-only)"
+
+# ========================= STEP 7: Systemd Service ===========================
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "[7/9] Creating systemd service (auto-start on boot)..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# We use a system-level service (not user-level) so it starts at boot
+# without needing the openclaw user to log in
+cat > /etc/systemd/system/openclaw-gateway.service <<SYSTEMD
 [Unit]
 Description=OpenClaw Gateway
-Documentation=https://docs.openclaw.ai
 After=network-online.target
 Wants=network-online.target
 
@@ -235,202 +323,187 @@ User=${OPENCLAW_USER}
 Group=${OPENCLAW_USER}
 WorkingDirectory=${OPENCLAW_HOME}
 
-Environment=HOME=${OPENCLAW_HOME}
-Environment=PATH=${NPM_GLOBAL}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=NODE_OPTIONS=--max-old-space-size=4096
-Environment=OPENCLAW_HOME=${OPENCLAW_HOME}
+# Set the PATH so the openclaw binary is found
+Environment="PATH=${NPM_GLOBAL}/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="HOME=${OPENCLAW_HOME}"
+Environment="NODE_ENV=production"
 
-ExecStart=${OPENCLAW_BIN} gateway --port 18789
-Restart=on-failure
+ExecStart=${OPENCLAW_BIN} gateway --port ${GATEWAY_PORT}
+
+# Restart on crash, but back off to avoid hammering
+Restart=always
 RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
-# Security hardening
+# Security: restrict what the service can do at the OS level
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=${OPENCLAW_HOME}
+ReadWritePaths=${OPENCLAW_CONFIG_DIR}
+ReadWritePaths=${OPENCLAW_WORKSPACE}
 PrivateTmp=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-RestrictNamespaces=true
-LockPersonality=true
 
-# Resource limits appropriate for 16GB RAM
-MemoryMax=8G
-MemoryHigh=6G
-TasksMax=512
+# Resource limits (generous for 16GB machine)
+MemoryMax=4G
+TasksMax=256
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SYSTEMD
 
 systemctl daemon-reload
-ok "Systemd service created."
+systemctl enable openclaw-gateway.service
 
-# ── 9. Configure UFW firewall ───────────────────────────────────────────────
-info "Configuring UFW firewall (LAN-only access)..."
+echo "  ✓ Systemd service created and enabled"
+echo "  ✓ Security directives: NoNewPrivileges, ProtectSystem=strict,"
+echo "    ProtectHome=read-only, PrivateTmp, MemoryMax=4G"
 
-# Reset UFW to clean state
-ufw --force reset &>/dev/null
+# ========================= STEP 8: Firewall + SSH Hardening ==================
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "[8/9] Configuring firewall and hardening SSH..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# Default policies: deny all incoming, allow outgoing
+# --- UFW Firewall ---
+ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 
 # Allow SSH from LAN only
-ufw allow from "$LAN_SUBNET" to any port 22 proto tcp comment 'SSH from LAN'
+ufw allow from "${LAN_CIDR}" to any port 22 proto tcp comment "SSH from LAN"
 
-# Allow OpenClaw gateway from LAN only
-ufw allow from "$LAN_SUBNET" to any port 18789 proto tcp comment 'OpenClaw from LAN'
+# Allow OpenClaw from LAN only
+ufw allow from "${LAN_CIDR}" to any port "${GATEWAY_PORT}" proto tcp comment "OpenClaw from LAN"
 
-# Enable UFW
+# Explicit deny for gateway from everywhere else
+ufw deny "${GATEWAY_PORT}/tcp" comment "Block OpenClaw from WAN"
+
 ufw --force enable
-ok "UFW firewall configured — only SSH and OpenClaw allowed from ${LAN_SUBNET}."
 
-# ── 10. Configure fail2ban ──────────────────────────────────────────────────
-info "Configuring fail2ban for SSH protection..."
+echo "  ✓ UFW: LAN-only access (${LAN_CIDR})"
+ufw status numbered
 
-cat > /etc/fail2ban/jail.local <<'EOF'
-[DEFAULT]
-bantime  = 1h
-findtime = 10m
-maxretry = 5
-backend  = systemd
+# --- SSH hardening ---
+SSH_CONFIG="/etc/ssh/sshd_config"
 
+# Disable root login
+if grep -q "^PermitRootLogin" "${SSH_CONFIG}"; then
+    sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' "${SSH_CONFIG}"
+else
+    echo "PermitRootLogin no" >> "${SSH_CONFIG}"
+fi
+
+# Disable SSH for the openclaw user (it should never need interactive SSH)
+if ! grep -q "DenyUsers ${OPENCLAW_USER}" "${SSH_CONFIG}"; then
+    echo "" >> "${SSH_CONFIG}"
+    echo "# Block SSH access for the openclaw service user" >> "${SSH_CONFIG}"
+    echo "DenyUsers ${OPENCLAW_USER}" >> "${SSH_CONFIG}"
+fi
+
+systemctl restart sshd
+
+# --- fail2ban ---
+cat > /etc/fail2ban/jail.local <<F2B
 [sshd]
 enabled = true
-port    = ssh
-filter  = sshd
-maxretry = 3
-bantime  = 1h
-EOF
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 5
+bantime = 3600
+findtime = 600
+F2B
 
-systemctl enable --now fail2ban &>/dev/null
+systemctl enable fail2ban
 systemctl restart fail2ban
-ok "fail2ban configured (SSH: 3 attempts, 1h ban)."
 
-# ── 11. Sysctl hardening ────────────────────────────────────────────────────
-info "Applying network security hardening (sysctl)..."
+echo "  ✓ SSH: root login disabled, '${OPENCLAW_USER}' SSH blocked, fail2ban active"
 
-cat > /etc/sysctl.d/99-openclaw-hardening.conf <<'EOF'
-# Disable IP forwarding (this is not a router)
-net.ipv4.ip_forward = 0
-net.ipv6.conf.all.forwarding = 0
+# ========================= STEP 9: Automatic Updates ========================
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "[9/9] Enabling automatic security updates..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# Ignore ICMP redirects
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv6.conf.all.accept_redirects = 0
-net.ipv6.conf.default.accept_redirects = 0
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<AUTOUPDATE
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+AUTOUPDATE
 
-# Don't send ICMP redirects
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
+systemctl enable unattended-upgrades
+echo "  ✓ Automatic security updates enabled"
 
-# Enable SYN flood protection
-net.ipv4.tcp_syncookies = 1
-
-# Log suspicious packets
-net.ipv4.conf.all.log_martians = 1
-net.ipv4.conf.default.log_martians = 1
-
-# Ignore broadcast pings
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-
-# Protect against source routing
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv4.conf.default.accept_source_route = 0
-net.ipv6.conf.all.accept_source_route = 0
-net.ipv6.conf.default.accept_source_route = 0
-EOF
-
-sysctl --system &>/dev/null
-ok "Sysctl hardening applied."
-
-# ── 12. Set up log rotation ─────────────────────────────────────────────────
-info "Configuring log rotation for OpenClaw..."
-cat > /etc/logrotate.d/openclaw <<EOF
-${OPENCLAW_HOME}/.openclaw/logs/*.log {
-    daily
-    missingok
-    rotate 14
-    compress
-    delaycompress
-    notifempty
-    create 0640 ${OPENCLAW_USER} ${OPENCLAW_USER}
-}
-EOF
-ok "Log rotation configured (14 days retention)."
-
-# ── 13. Enable and start the service ────────────────────────────────────────
-info "Enabling OpenClaw gateway service..."
-systemctl enable openclaw-gateway
-ok "Service enabled (will start on boot)."
-
-# Don't auto-start yet — user needs to run onboarding first
-warn "Service is NOT started yet. You need to run onboarding first (see below)."
-
-# ── Summary ──────────────────────────────────────────────────────────────────
+# ========================= COMPLETE ==========================================
 echo ""
-echo "============================================================================"
-echo -e "${GREEN}  OpenClaw Secure LAN Setup Complete!${NC}"
-echo "============================================================================"
 echo ""
-echo "  SYSTEM"
-echo "  ├─ User:          ${OPENCLAW_USER}"
-echo "  ├─ Home:          ${OPENCLAW_HOME}"
-echo "  ├─ Config:        ${OPENCLAW_CONFIG_DIR}/openclaw.json"
-echo "  ├─ Node.js:       $(node --version)"
-echo "  └─ OpenClaw:      ${OPENCLAW_BIN}"
+echo "╔═══════════════════════════════════════════════════════════════════════════╗"
+echo "║                     ✅  SETUP COMPLETE                                  ║"
+echo "╚═══════════════════════════════════════════════════════════════════════════╝"
 echo ""
-echo "  NETWORK"
-echo "  ├─ Interface:     ${DEFAULT_IFACE}"
-echo "  ├─ LAN IP:        ${LAN_IP_BARE}"
-echo "  ├─ Gateway Port:  18789"
-echo "  ├─ Bound to:      ${LAN_IP_BARE}:18789 (LAN only)"
-echo "  └─ Firewall:      UFW active — SSH + 18789 from ${LAN_SUBNET} only"
+echo "  Your N150 mini PC is now hardened and ready."
 echo ""
-echo "  SECURITY"
-echo "  ├─ UFW:           Deny all except SSH + OpenClaw from LAN"
-echo "  ├─ fail2ban:      SSH brute-force protection (3 tries, 1h ban)"
-echo "  ├─ Sysctl:        Network hardening applied"
-echo "  ├─ Systemd:       Service sandboxed (NoNewPrivileges, ProtectSystem, etc.)"
-echo "  ├─ Auth:          Password-protected gateway dashboard"
-echo "  └─ Auto-updates:  Unattended security patches enabled"
+echo "  ┌─────────────────────────────────────────────────────────────────────┐"
+echo "  │  NEXT STEP: Run the OpenClaw onboarding wizard                    │"
+echo "  └─────────────────────────────────────────────────────────────────────┘"
 echo ""
-echo -e "  ${YELLOW}GATEWAY PASSWORD:${NC}  ${GATEWAY_PASSWORD}"
-echo -e "  ${YELLOW}Save this password!${NC} You'll need it to access the Control UI."
-echo "  (Also stored in ${OPENCLAW_CONFIG_DIR}/openclaw.json)"
+echo "  The wizard is interactive — it sets up your AI provider and messaging"
+echo "  channel. Run it as the openclaw user:"
 echo ""
-echo "============================================================================"
-echo "  NEXT STEPS"
-echo "============================================================================"
+echo "    sudo -iu ${OPENCLAW_USER}"
+echo "    openclaw onboard"
 echo ""
-echo "  1. Run the onboarding wizard to configure your AI provider:"
+echo "  The wizard will ask you to:"
+echo "    1. Choose an AI provider   → Anthropic Claude is strongly recommended"
+echo "    2. Enter your API key      → Get one from console.anthropic.com"
+echo "    3. Pick a channel          → Telegram is easiest to set up"
+echo "    4. Pair your account       → Approve the pairing code when prompted"
 echo ""
-echo "     sudo -u ${OPENCLAW_USER} bash -c \\"
-echo "       'export PATH=${NPM_GLOBAL}/bin:\$PATH && openclaw onboard'"
+echo "  When the wizard finishes, start the gateway:"
 echo ""
-echo "  2. Start the gateway service:"
+echo "    exit                                    # back to your admin user"
+echo "    sudo systemctl start openclaw-gateway   # start the service"
 echo ""
-echo "     sudo systemctl start openclaw-gateway"
+echo "  ┌─────────────────────────────────────────────────────────────────────┐"
+echo "  │  ACCESS THE CONTROL UI                                            │"
+echo "  └─────────────────────────────────────────────────────────────────────┘"
 echo ""
-echo "  3. Access the Control UI from any device on your LAN:"
+echo "  From any device on your LAN, open:"
 echo ""
-echo "     http://${LAN_IP_BARE}:18789"
+echo "    http://${LOCAL_IP}:${GATEWAY_PORT}/?token=${GATEWAY_TOKEN}"
 echo ""
-echo "  4. Check status and logs:"
+echo "  ⚠  SAVE THIS TOKEN — you need it to log into the Control UI:"
 echo ""
-echo "     systemctl status openclaw-gateway"
-echo "     journalctl -u openclaw-gateway -f"
+echo "    ${GATEWAY_TOKEN}"
 echo ""
-echo "  5. (Optional) Run the gateway interactively for debugging:"
+echo "  The token is also stored in: ${OPENCLAW_CONFIG_FILE}"
 echo ""
-echo "     sudo -u ${OPENCLAW_USER} bash -c \\"
-echo "       'export PATH=${NPM_GLOBAL}/bin:\$PATH && openclaw gateway --port 18789 --verbose'"
+echo "  ┌─────────────────────────────────────────────────────────────────────┐"
+echo "  │  SECURITY SUMMARY                                                 │"
+echo "  └─────────────────────────────────────────────────────────────────────┘"
 echo ""
-echo "============================================================================"
+echo "  ✓ Firewall        LAN-only (${LAN_CIDR}), all other inbound blocked"
+echo "  ✓ Gateway auth    Token required (auto-generated, 48 hex chars)"
+echo "  ✓ Exec consent    Every command requires your approval"
+echo "  ✓ Exec default    Deny-by-default with ask-always fallback"
+echo "  ✓ Filesystem      Restricted to workspace directory only"
+echo "  ✓ DM policy       Per-channel peer isolation (pairing required)"
+echo "  ✓ Service user    No sudo, no SSH, no privilege escalation"
+echo "  ✓ Systemd         NoNewPrivileges, ProtectSystem=strict, PrivateTmp"
+echo "  ✓ SSH             Root login disabled, fail2ban active"
+echo "  ✓ Auto-updates    Unattended security patches enabled"
+echo ""
+echo "  ┌─────────────────────────────────────────────────────────────────────┐"
+echo "  │  USEFUL COMMANDS                                                  │"
+echo "  └─────────────────────────────────────────────────────────────────────┘"
+echo ""
+echo "  Start gateway     sudo systemctl start openclaw-gateway"
+echo "  Stop gateway      sudo systemctl stop openclaw-gateway"
+echo "  Restart gateway   sudo systemctl restart openclaw-gateway"
+echo "  View status       sudo systemctl status openclaw-gateway"
+echo "  View logs         sudo journalctl -u openclaw-gateway -f"
+echo "  Health check      sudo -iu ${OPENCLAW_USER} openclaw doctor"
+echo "  Security audit    sudo -iu ${OPENCLAW_USER} openclaw security audit --deep"
+echo "  Update OpenClaw   sudo -iu ${OPENCLAW_USER} npm update -g openclaw@latest"
+echo "  Dashboard URL     sudo -iu ${OPENCLAW_USER} openclaw dashboard --no-open"
+echo ""
+echo "═══════════════════════════════════════════════════════════════════════════"
