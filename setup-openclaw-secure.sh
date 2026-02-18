@@ -148,10 +148,9 @@ fi
 
 # Configure Docker daemon for N150 (limit logging, sensible defaults)
 mkdir -p /etc/docker
-if [[ ! -f /etc/docker/daemon.json ]] || ! grep -q 'openclaw-tuned' /etc/docker/daemon.json 2>/dev/null; then
+if [[ ! -f /etc/docker/daemon.json ]] || ! grep -q 'overlay2' /etc/docker/daemon.json 2>/dev/null; then
     cat > /etc/docker/daemon.json << 'DOCKERCFG'
 {
-  "_comment": "openclaw-tuned",
   "log-driver": "json-file",
   "log-opts": {
     "max-size": "10m",
