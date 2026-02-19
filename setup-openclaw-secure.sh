@@ -126,6 +126,12 @@ apt-get install -y \
 
 echo "  ✓ System packages updated"
 
+# Set console font to 14x28 for small/low-res screens
+sed -i 's/^FONTFACE=.*/FONTFACE="Terminus"/' /etc/default/console-setup
+sed -i 's/^FONTSIZE=.*/FONTSIZE="14x28"/' /etc/default/console-setup
+setupcon --force 2>/dev/null || true
+echo "  ✓ Console font set to Terminus 14x28"
+
 # ========================= STEP 2: Swap File ================================
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
